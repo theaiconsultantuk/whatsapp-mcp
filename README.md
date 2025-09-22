@@ -1,5 +1,7 @@
 # WhatsApp MCP Server
 
+> **🚀 Improved Fork**: This repository includes critical fixes for compilation errors and network connectivity issues found in the original implementation. See the [Troubleshooting](#troubleshooting) section for details.
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
@@ -18,18 +20,19 @@ Here's an example of what you can do when it's connected to Claude.
 
 ### Prerequisites
 
-- Go
-- Python 3.6+
+- Go (version 1.19 or higher recommended)
+- Python 3.10+ (required for MCP server dependencies)
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
+- VPN access (_recommended_) - Some regions may require VPN during initial WhatsApp connection
 
 ### Steps
 
 1. **Clone this repository**
 
    ```bash
-   git clone https://github.com/lharries/whatsapp-mcp.git
+   git clone https://github.com/theaiconsultantuk/whatsapp-mcp.git
    cd whatsapp-mcp
    ```
 
@@ -171,6 +174,41 @@ By default, just the metadata of the media is stored in the local database. The 
 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
 - Make sure both the Go application and the Python server are running for the integration to work properly.
+
+### Compilation Issues (Fixed in this Fork)
+
+This fork includes fixes for compilation errors that may occur with newer versions of the whatsmeow library:
+
+#### Context Parameter Errors
+If you encounter errors like:
+```
+not enough arguments in call to client.Download
+not enough arguments in call to sqlstore.New
+not enough arguments in call to container.GetFirstDevice
+not enough arguments in call to client.Store.Contacts.GetContact
+```
+
+These have been **fixed in this repository**. The following functions now include the required `context.Context` parameter:
+- `client.Download(context.Background(), downloader)`
+- `sqlstore.New(context.Background(), "sqlite3", dbPath, logger)`
+- `container.GetFirstDevice(context.Background())`
+- `client.Store.Contacts.GetContact(context.Background(), jid)`
+
+### Network Connection Issues
+
+#### VPN Requirement
+If you encounter "Couldn't log on" errors during QR code scanning, this may be due to regional network restrictions:
+
+**Solution**: Use a VPN (preferably US-based) during the initial WhatsApp connection:
+1. Connect to a VPN
+2. Run the Go application and scan the QR code
+3. Once connected and syncing messages, you can disconnect the VPN
+4. The application will maintain the connection for subsequent runs
+
+#### Firewall/Network Restrictions
+- Some corporate networks or ISPs may block WhatsApp Web connections
+- Try switching between WiFi and mobile data if connection fails
+- Ensure ports used by WhatsApp Web are not blocked
 
 ### Authentication Issues
 
