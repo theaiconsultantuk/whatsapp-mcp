@@ -1,3 +1,51 @@
+# Database files (contains personal data)
 *.db
+whatsapp-bridge/store/
+
+# Build artifacts
+whatsapp-bridge/main
+whatsapp-bridge/whatsapp-bridge
+
+# Configuration files with keys
 claude_desktop_config.json
+.env
+
+# Logs
+*.log
 whatsapp.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime caches
+.channels_cache_v2.json
+.users_cache.json
+**/.channels_cache_v2.json
+**/.users_cache.json
+
+# Claude-flow / swarm / agentdb runtime
+.claude-flow/
+.swarm/
+**/.claude-flow/
+**/.swarm/
+agentdb.rvf
+agentdb.rvf.lock
+**/agentdb.rvf
+**/agentdb.rvf.lock
+CHECKPOINTS/
+**/CHECKPOINTS/
+
+# Extra build artifacts / binaries
+whatsapp-bridge/whatsapp-bridge.old-*
+whatsapp-bridge/whatsapp-client

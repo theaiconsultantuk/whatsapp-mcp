@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -53,8 +54,8 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// Open SQLite database for messages (WAL mode for better concurrent access)
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -276,7 +277,77 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Audio types (additional)
+		case "mp3":
+			mediaType = whatsmeow.MediaAudio
+			mimeType = "audio/mpeg"
+		case "m4a":
+			mediaType = whatsmeow.MediaAudio
+			mimeType = "audio/mp4"
+		case "wav":
+			mediaType = whatsmeow.MediaAudio
+			mimeType = "audio/wav"
+		case "aac":
+			mediaType = whatsmeow.MediaAudio
+			mimeType = "audio/aac"
+
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "ppt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-powerpoint"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "json":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/json"
+		case "md":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/markdown"
+		case "html", "htm":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/html"
+		case "xml":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/xml"
+		case "zip":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
+		case "apkg":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
+		case "svg":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "image/svg+xml"
+		case "webm":
+			mediaType = whatsmeow.MediaVideo
+			mimeType = "video/webm"
+		case "mkv":
+			mediaType = whatsmeow.MediaVideo
+			mimeType = "video/x-matroska"
+
+		// Fallback for unknown types
 		default:
 			mediaType = whatsmeow.MediaDocument
 			mimeType = "application/octet-stream"
@@ -345,8 +416,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			docFileName := mediaPath[strings.LastIndex(mediaPath, "/")+1:]
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(docFileName),
+				Title:         proto.String(docFileName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -776,11 +849,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
+
+	// Bind the port synchronously. If it's already taken, another
+	// whatsapp-client is running — exit now instead of running a crippled
+	// second instance that fights the first one for the SQLite lock.
+	listener, err := net.Listen("tcp", serverAddr)
+	if err != nil {
+		fmt.Printf("FATAL: cannot bind %s: %v\n", serverAddr, err)
+		fmt.Println("Another whatsapp-client is already running. Exiting to avoid a database lock.")
+		os.Exit(1)
+	}
+
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.Serve(listener, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -800,7 +884,7 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -835,18 +919,22 @@ func main() {
 	defer messageStore.Close()
 
 	// Setup event handling for messages and history sync
+	// Process messages asynchronously to avoid blocking whatsmeow's event loop
+	// (blocking causes "Node handling took..." warnings and missed messages)
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			// Process in goroutine so event loop isn't blocked by DB/network calls
+			go handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
-			// Process history sync events
-			handleHistorySync(client, messageStore, v, logger)
+			// Process in goroutine so event loop isn't blocked
+			go handleHistorySync(client, messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Note: WhatsApp automatically syncs recent messages on connection.
+			// Manual history sync is available via the 'history' command if needed.
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -973,7 +1061,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -1164,23 +1252,30 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
+	// NOTE: BuildHistorySyncRequest requires a valid MessageInfo object, not nil.
+	// This function is currently disabled to prevent crashes.
+	// WhatsApp automatically syncs messages on connection.
+	fmt.Println("Manual history sync is currently disabled.")
+	fmt.Println("WhatsApp automatically syncs recent messages when you connect.")
+	return
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
-	}
+	// DISABLED CODE - causes nil pointer dereference
+	// historyMsg := client.BuildHistorySyncRequest(nil, 100)
+	// if historyMsg == nil {
+	// 	fmt.Println("Failed to build history sync request.")
+	// 	return
+	// }
+	//
+	// _, err := client.SendMessage(context.Background(), types.JID{
+	// 	Server: "s.whatsapp.net",
+	// 	User:   "status",
+	// }, historyMsg)
+	//
+	// if err != nil {
+	// 	fmt.Printf("Failed to request history sync: %v\n", err)
+	// } else {
+	// 	fmt.Println("History sync requested. Waiting for server response...")
+	// }
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
