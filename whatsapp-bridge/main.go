@@ -814,7 +814,17 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
+	// Generate a local path for the file, PREFIXED WITH THE MESSAGE ID.
+	//
+	// The stored filename is derived from the message timestamp to the second
+	// (e.g. image_20260728_042608.jpg), so two images sent in the same second get
+	// the SAME name. Combined with the "file already exists -> return it" check
+	// below, the second download silently returned the FIRST image and reported
+	// success. Hit for real on 28 Jul: two screenshots sent together, and the
+	// bridge served the same one twice with no error. Silently serving the wrong
+	// file is worse than failing, so the message id (unique per message) now
+	// disambiguates.
+	filename = fmt.Sprintf("%s_%s", messageID, filename)
 	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
 	// Get absolute path
@@ -864,8 +874,33 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
+	// Download the media using whatsmeow client.
+	//
+	// TWO-ATTEMPT, and the second attempt is the one that actually works for most
+	// media. whatsmeow prefers GetDirectPath() over GetURL() when both are set, but
+	// this bridge never STORES the real direct_path — extractDirectPathFromURL tries
+	// to reverse it out of the stored URL, and that only works for the old
+	// "/v/t62.7118-24/..." CDN form. Current WhatsApp image URLs look like
+	//   https://mmg.whatsapp.net/o1/v/t24/f2/m235/AQNaaCu9...?ccb=9-4&oh=...&oe=...
+	// where "/o1/v/t24/f2/m235/..." is a routed CDN path, NOT a direct path. Handing
+	// that to whatsmeow produced a hard 403 on every image, which is why screenshots
+	// could never be fetched. Verified 28 Jul: a plain GET of the stored URL returns
+	// 200 with the full ciphertext, so the URL and keys were always good.
+	//
+	// So: try the derived direct path (correct for older messages and cheap when it
+	// works), and on ANY failure retry with it cleared, which makes whatsmeow fall
+	// back to the stored URL and its oh/oe auth params. Both errors are reported if
+	// both fail — a bare "403" told us nothing last time.
 	mediaData, err := client.Download(context.Background(), downloader)
+	if err != nil && directPath != "" {
+		fmt.Printf("  direct-path download failed (%v) — retrying via stored URL\n", err)
+		firstErr := err
+		downloader.DirectPath = ""
+		mediaData, err = client.Download(context.Background(), downloader)
+		if err != nil {
+			return false, "", "", "", fmt.Errorf("failed to download media: direct-path attempt: %v; url attempt: %v", firstErr, err)
+		}
+	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -892,10 +927,19 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// KEEP THE QUERY STRING. This line used to strip it, and that single strip is
+	// why every media download 403'd. whatsmeow's DownloadMediaWithPath builds:
+	//
+	//   https://<host><directPath>&hash=<encSHA>&mms-type=<t>&__wa-mms=
+	//
+	// It appends "&hash=" with an AMPERSAND, so it REQUIRES directPath to already
+	// carry its own "?..." query string. Stripping it produced a URL with an "&"
+	// and no "?" — malformed, and the CDN answered 403 for every image, forever.
+	//
+	// The query params are not decoration either: oh= is the auth hash and oe= the
+	// expiry, and the CDN rejects the request without them. Verified 28 Jul: a plain
+	// GET of the full stored URL returns 200 with the ciphertext, so the stored URL
+	// and keys were always good — only this reconstruction was broken.
 	return "/" + pathPart
 }
 
