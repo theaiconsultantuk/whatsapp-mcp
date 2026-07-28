@@ -103,7 +103,12 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+    else:
+        # Text messages previously exposed no id at all. The id is needed to quote a
+        # message via send_message(reply_to=...), so surface it here too.
+        content_prefix = f"[Message ID: {message.id}] "
+
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
@@ -622,18 +627,22 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, reply_to: Optional[str] = None) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+        # Only include reply_to when set, so a normal send is byte-for-byte the same
+        # request the bridge has always received.
+        if reply_to:
+            payload["reply_to"] = reply_to
+
         response = requests.post(url, json=payload)
         
         # Check if the request was successful

@@ -201,10 +201,139 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// ReplyTo is the WhatsApp stanza id of a message in the SAME chat that this
+	// message should be sent as a quoted reply to. Empty => a normal, unquoted send.
+	ReplyTo string `json:"reply_to,omitempty"`
 }
 
-// Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// Look up a single archived message by its stanza id within one specific chat.
+//
+// The (id, chat_jid) pair is the table's primary key and the scoping is deliberate:
+// a stanza id must never be resolved by id alone (see buildQuotedContext).
+func (store *MessageStore) GetMessageByID(id, chatJID string) (sender string, content string, isFromMe bool, err error) {
+	err = store.db.QueryRow(
+		"SELECT sender, content, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&sender, &content, &isFromMe)
+	return
+}
+
+// Recover the full JID of the sender of an archived message.
+//
+// The messages table only stores the *user* part of a sender (it is written from
+// msg.Info.Sender.User), so the server half — "@s.whatsapp.net" vs "@lid" — has to be
+// reconstructed before it can be used as ContextInfo.Participant. Digit-length guessing
+// is not safe (phone numbers and @lid ids overlap in length), so this resolves it from
+// authoritative sources only, and errors out rather than guessing.
+func resolveSenderJID(client *whatsmeow.Client, messageStore *MessageStore, chatJID types.JID, sender string, isFromMe bool) (types.JID, error) {
+	ownPN := client.Store.GetJID().ToNonAD()
+	ownLID := client.Store.GetLID().ToNonAD()
+
+	if isFromMe {
+		// For our own messages the stored 'sender' is one of OUR two identities (phone
+		// number or @lid), depending on how the chat is addressed. Match it explicitly
+		// rather than assuming, and only fall back to the chat's addressing mode.
+		if !ownLID.IsEmpty() && sender == ownLID.User {
+			return ownLID, nil
+		}
+		if !ownPN.IsEmpty() && sender == ownPN.User {
+			return ownPN, nil
+		}
+		if chatJID.Server == types.HiddenUserServer && !ownLID.IsEmpty() {
+			return ownLID, nil
+		}
+		if !ownPN.IsEmpty() {
+			return ownPN, nil
+		}
+		return types.EmptyJID, fmt.Errorf("cannot determine own JID (client not logged in?)")
+	}
+
+	// 1:1 chat: the counterparty *is* the chat, so the chat JID already carries both the
+	// correct user and the correct server.
+	if chatJID.Server != types.GroupServer {
+		return chatJID.ToNonAD(), nil
+	}
+
+	// Group chat: only the bare user part was stored, so ask whatsmeow's own LID<->PN
+	// map which namespace this user lives in.
+	ctx := context.Background()
+	lidCandidate := types.JID{User: sender, Server: types.HiddenUserServer}
+	if pn, err := client.Store.LIDs.GetPNForLID(ctx, lidCandidate); err == nil && !pn.IsEmpty() {
+		return lidCandidate, nil
+	}
+	pnCandidate := types.JID{User: sender, Server: types.DefaultUserServer}
+	if lid, err := client.Store.LIDs.GetLIDForPN(ctx, pnCandidate); err == nil && !lid.IsEmpty() {
+		return pnCandidate, nil
+	}
+
+	// Last resort: if we already have a 1:1 chat with this user, that chat's JID tells us
+	// the namespace (chats.jid is a full JID, unlike messages.sender).
+	var foundJID string
+	err := messageStore.db.QueryRow(
+		"SELECT jid FROM chats WHERE jid = ? OR jid = ? LIMIT 1",
+		lidCandidate.String(), pnCandidate.String(),
+	).Scan(&foundJID)
+	if err == nil {
+		if parsed, perr := types.ParseJID(foundJID); perr == nil {
+			return parsed.ToNonAD(), nil
+		}
+	}
+
+	return types.EmptyJID, fmt.Errorf("could not determine whether group participant %q is a phone number or an @lid", sender)
+}
+
+// Build the ContextInfo that turns an outgoing message into a quoted reply.
+//
+// CRITICAL: the archived message is looked up by (id, chat_jid), never by id alone.
+// WhatsApp @lid identifiers are chat-scoped — the same numeric sender id can belong to a
+// completely different person in a different chat — so resolving the quoted message from
+// another chat's row would attribute the quote to the wrong human.
+func buildQuotedContext(client *whatsmeow.Client, messageStore *MessageStore, chatJID types.JID, quotedID string) (*waProto.ContextInfo, error) {
+	sender, content, isFromMe, err := messageStore.GetMessageByID(quotedID, chatJID.String())
+	if err == sql.ErrNoRows {
+		// Hard error on purpose. Falling back to an unquoted send would return
+		// success=true for a reply that never quoted anything — a silent lie to the
+		// caller. Better to fail loudly and let them supply a valid id.
+		return nil, fmt.Errorf("message id %q not found in chat %s (reply_to must be an id from the chat you are sending to)", quotedID, chatJID.String())
+	} else if err != nil {
+		return nil, fmt.Errorf("error looking up reply_to message: %v", err)
+	}
+
+	participantJID, err := resolveSenderJID(client, messageStore, chatJID, sender, isFromMe)
+	if err != nil {
+		return nil, fmt.Errorf("error resolving sender of reply_to message %q: %v", quotedID, err)
+	}
+
+	return &waProto.ContextInfo{
+		StanzaID:    proto.String(quotedID),
+		Participant: proto.String(participantJID.String()),
+		// The recipient's client normally renders the quote from its own local copy,
+		// keyed on StanzaID; this embedded copy is the fallback preview. It may be empty
+		// for media-only messages, which is fine.
+		QuotedMessage: &waProto.Message{
+			Conversation: proto.String(content),
+		},
+	}, nil
+}
+
+// Attach quoted-reply context to whichever media sub-message was built.
+func attachContextInfo(msg *waProto.Message, ctxInfo *waProto.ContextInfo) {
+	switch {
+	case msg.ImageMessage != nil:
+		msg.ImageMessage.ContextInfo = ctxInfo
+	case msg.AudioMessage != nil:
+		msg.AudioMessage.ContextInfo = ctxInfo
+	case msg.VideoMessage != nil:
+		msg.VideoMessage.ContextInfo = ctxInfo
+	case msg.DocumentMessage != nil:
+		msg.DocumentMessage.ContextInfo = ctxInfo
+	}
+}
+
+// Function to send a WhatsApp message.
+// quotedID is optional: when non-empty the message is sent as a quoted reply to that
+// stanza id (which must exist in the recipient's chat). Empty => unchanged behaviour.
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -227,6 +356,16 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		recipientJID = types.JID{
 			User:   recipient,
 			Server: "s.whatsapp.net", // For personal chats
+		}
+	}
+
+	// Resolve the quoted-reply context up front so an invalid reply_to aborts BEFORE we
+	// upload media or send anything.
+	var quotedCtx *waProto.ContextInfo
+	if quotedID != "" {
+		quotedCtx, err = buildQuotedContext(client, messageStore, recipientJID, quotedID)
+		if err != nil {
+			return false, fmt.Sprintf("Error preparing quoted reply: %v", err)
 		}
 	}
 
@@ -429,6 +568,18 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
+		}
+
+		if quotedCtx != nil {
+			attachContextInfo(msg, quotedCtx)
+		}
+	} else if quotedCtx != nil {
+		// A quoted reply cannot ride on a plain Conversation string — the quote lives in
+		// ExtendedTextMessage.ContextInfo, so text replies must be sent as an
+		// ExtendedTextMessage instead.
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text:        proto.String(message),
+			ContextInfo: quotedCtx,
 		}
 	} else {
 		msg.Conversation = proto.String(message)
@@ -778,8 +929,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		// Send the message (req.ReplyTo empty => normal unquoted send)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
