@@ -586,10 +586,55 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Persist our own outbound message.
+	//
+	// Without this the store holds only INBOUND messages plus outbound sent from the
+	// phone — anything sent through this API is invisible to every reader of the DB.
+	// Proven 2026-08-01: three messages sent via the API returned zero rows on a
+	// content match, while max(timestamp) for is_from_me=1 still showed the previous
+	// day's phone-sent message.
+	//
+	// That is worse than merely incomplete: a reader cannot distinguish "Paul never
+	// replied" from "Paul replied through the API", so an automated watcher would
+	// chase a contact who had just been chased.
+	//
+	// Deliberately NOT calling StoreChat here: it is INSERT OR REPLACE on (jid, name,
+	// last_message_time), so passing an empty name would blank the chat's name. Most
+	// chats in this store already have no real name; destroying the remainder to
+	// freshen a timestamp is a bad trade. chats.last_message_time therefore stays
+	// authoritative for inbound only.
+	if messageStore != nil {
+		selfSender := ""
+		if client.Store != nil && client.Store.ID != nil {
+			selfSender = client.Store.ID.User
+		}
+		storedMediaType := ""
+		storedFilename := ""
+		if mediaPath != "" {
+			storedMediaType = "media"
+			storedFilename = filepath.Base(mediaPath)
+		}
+		if storeErr := messageStore.StoreMessage(
+			sendResp.ID,
+			recipientJID.String(),
+			selfSender,
+			message,
+			sendResp.Timestamp,
+			true, // is_from_me
+			storedMediaType,
+			storedFilename,
+			"", nil, nil, nil, 0,
+		); storeErr != nil {
+			// Never fail the send because persistence failed — the message really did
+			// go out. Log loudly so the gap is visible rather than silent.
+			fmt.Printf("WARNING: message sent to %s but NOT stored: %v\n", recipient, storeErr)
+		}
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
