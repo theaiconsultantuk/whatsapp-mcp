@@ -683,8 +683,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
-	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	// Never offer our own user as a fallback chat name — that is how every @lid chat
+	// came to be named after this account.
+	nameHint := sender
+	if msg.Info.IsFromMe {
+		nameHint = ""
+	}
+	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, nameHint, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -1253,11 +1258,13 @@ func main() {
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
+	// A purely numeric name is a placeholder (a bare JID user), not a real name — fall
+	// through and try to resolve it again rather than locking the placeholder in forever.
+	// 24 Sep 2026: 84 @lid chats were all named after this account's OWN LID, because the
+	// first message seen in each was one we sent and the old fallback used the sender.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+	if err == nil && existingName != "" && !isNumericName(existingName) {
 		return existingName
 	}
 
@@ -1315,15 +1322,15 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
+		name = resolveContactName(client, jid)
+		if name == "" && sender != "" && !isOwnUser(client, sender) {
 			name = sender
-		} else {
-			// Last fallback to JID
+		}
+		if name == "" && existingName != "" {
+			// Still unresolvable — keep what we had rather than churning it.
+			name = existingName
+		}
+		if name == "" {
 			name = jid.User
 		}
 
@@ -1331,6 +1338,59 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	}
 
 	return name
+}
+
+func isNumericName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isOwnUser reports whether a bare JID user is this account, in either namespace.
+func isOwnUser(client *whatsmeow.Client, user string) bool {
+	if client.Store.ID != nil && client.Store.ID.User == user {
+		return true
+	}
+	return client.Store.LID.User != "" && client.Store.LID.User == user
+}
+
+// resolveContactName looks a 1:1 JID up in the contact store. Contacts are keyed by
+// phone-number JID, so an @lid chat is first mapped to its PN via whatsmeow's LID map;
+// without that step every @lid lookup misses.
+func resolveContactName(client *whatsmeow.Client, jid types.JID) string {
+	ctx := context.Background()
+	candidates := []types.JID{jid.ToNonAD()}
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid.ToNonAD()); err == nil && !pn.IsEmpty() {
+			candidates = append([]types.JID{pn.ToNonAD()}, candidates...)
+		}
+	}
+	var push string
+	for _, c := range candidates {
+		contact, err := client.Store.Contacts.GetContact(ctx, c)
+		if err != nil || !contact.Found {
+			continue
+		}
+		if contact.FullName != "" {
+			return contact.FullName
+		}
+		if contact.FirstName != "" {
+			return contact.FirstName
+		}
+		if push == "" && contact.PushName != "" {
+			push = contact.PushName
+		}
+		if push == "" && contact.BusinessName != "" {
+			push = contact.BusinessName
+		}
+	}
+	return push
 }
 
 // Handle history sync events
