@@ -186,7 +186,22 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions. Without these a "screenshot + instructions" message is stored with
+	// empty content and the instructions are lost (Emily's briefs, 13 and 22 Oct 2026).
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	// History sync can deliver a captioned document still wrapped.
+	if wrapped := msg.GetDocumentWithCaptionMessage(); wrapped != nil {
+		return wrapped.GetMessage().GetDocumentMessage().GetCaption()
+	}
+
 	return ""
 }
 
@@ -1442,14 +1457,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
