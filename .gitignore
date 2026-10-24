@@ -52,3 +52,6 @@ whatsapp-bridge/whatsapp-client
 # Local runtime output and rollback binaries (never publish)
 whatsapp-bridge/logs/
 whatsapp-bridge/whatsapp-bridge.backup-*
+
+# WhatsApp MCP launch tracking (local only)
+whatsapp-mcp-server/logs/

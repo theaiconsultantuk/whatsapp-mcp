@@ -1,3 +1,7 @@
+import os
+import subprocess
+import threading
+import time
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -252,6 +256,85 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+def _parent_of(pid: int) -> int:
+    out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                         capture_output=True, text=True).stdout.strip()
+    return int(out) if out.isdigit() else 1
+
+
+def _exit_when_orphaned(interval: float = 20.0) -> None:
+    # mcp 1.6.0's stdio server does not exit when the client closes stdin, so every
+    # Claude session that ended left this server (and its uv wrapper) running.
+    # 935 of them exhausted the Mac's process table on 23 Oct 2026. Exit once the
+    # client is gone: our parent is launchd, or our uv wrapper's parent is.
+    parent = os.getppid()
+    try:
+        via_uv = subprocess.run(["ps", "-o", "comm=", "-p", str(parent)], capture_output=True,
+                                text=True).stdout.strip().endswith("uv")
+    except Exception:
+        via_uv = False
+    while True:
+        time.sleep(interval)
+        if os.getppid() == 1:
+            os._exit(0)
+        try:
+            if via_uv and _parent_of(parent) == 1:
+                os._exit(0)
+        except Exception:
+            pass  # fork failed (e.g. EAGAIN); try again next tick
+
+
+LAUNCH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "launches.jsonl")
+BURST_COUNT, BURST_WINDOW = 20, 600  # launches per seconds that count as a burst
+
+
+def _record_launch() -> None:
+    # Who started this server? 325 orphans came from ~300 launches in one hour on
+    # 23 Oct 2026 with no known source. Log each launch's ancestry so a burst can be
+    # traced, and raise a desktop alert (at most every 30 min) when one happens.
+    import json
+    try:
+        procs = {}
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,user=,command="],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].isdigit():
+                procs[int(parts[0])] = (int(parts[1]), parts[2], parts[3][:200])
+        chain, pid = [], os.getppid()
+        while pid in procs and pid > 1 and len(chain) < 8:
+            ppid, user, cmd = procs[pid]
+            chain.append({"pid": pid, "user": user, "cmd": cmd})
+            pid = ppid
+        env = {k: os.environ[k] for k in ("CLAUDE_CODE_ENTRYPOINT", "SSH_CONNECTION", "TMUX",
+                                          "TERM_PROGRAM", "PWD") if k in os.environ}
+        now = time.time()
+        os.makedirs(os.path.dirname(LAUNCH_LOG), exist_ok=True)
+        fd = os.open(LAUNCH_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "epoch": now,
+                                "pid": os.getpid(), "env": env, "ancestry": chain}) + "\n")
+
+        recent = 0
+        with open(LAUNCH_LOG) as f:
+            for line in f.readlines()[-500:]:
+                try:
+                    recent += now - json.loads(line)["epoch"] < BURST_WINDOW
+                except Exception:
+                    pass
+        stamp = LAUNCH_LOG + ".alerted"
+        if recent >= BURST_COUNT and (not os.path.exists(stamp) or now - os.path.getmtime(stamp) > 1800):
+            open(stamp, "w").close()
+            subprocess.run(["osascript", "-e",
+                            f'display notification "{recent} WhatsApp MCP launches in 10 min - see '
+                            f'whatsapp-mcp-server/logs/launches.jsonl" with title "WhatsApp MCP burst"'],
+                           capture_output=True)
+    except Exception:
+        pass  # tracking must never stop the server starting
+
+
 if __name__ == "__main__":
+    _record_launch()
+    threading.Thread(target=_exit_when_orphaned, daemon=True).start()
     # Initialize and run the server
     mcp.run(transport='stdio')
