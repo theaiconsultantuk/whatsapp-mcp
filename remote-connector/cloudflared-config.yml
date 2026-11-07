@@ -1,0 +1,8 @@
+# DRAFT - not active. Copy to ~/.cloudflared/whatsapp-mcp.yml after Paul's go.
+tunnel: whatsapp-mcp
+credentials-file: /Users/paulcowen/.cloudflared/<TUNNEL_UUID from step 2>.json
+ingress:
+  - hostname: wa-mcp.theaiconsultant.co.uk
+    service: http://127.0.0.1:18765
+    path: ^/mcp
+  - service: http_status:404

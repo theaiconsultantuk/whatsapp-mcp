@@ -1108,7 +1108,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	// Bind the port synchronously. If it's already taken, another
 	// whatsapp-client is running — exit now instead of running a crippled

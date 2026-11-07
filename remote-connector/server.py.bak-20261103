@@ -1,0 +1,79 @@
+"""Remote (streamable HTTP) wrapper for the WhatsApp MCP. Does not modify main.py.
+Binds 127.0.0.1 only. Requires Bearer token (env WHATSAPP_MCP_TOKEN, from Doppler).
+Send tools are OFF unless WA_ALLOW_SEND=1. Even when on, sends go through an approval
+gate (WA_SEND_APPROVAL=1 default): a request file is written to ~/approvals/ and the send
+only happens after ~/approvals/<id>.decision contains APPROVE."""
+import os, sys, hmac, json, time, uuid
+SRV = os.path.expanduser("~/ClaudeProjects/whatsapp-mcp/whatsapp-mcp-server")
+sys.path.insert(0, SRV); os.chdir(SRV)
+import main  # registers tools on main.mcp; __main__ block not run
+import uvicorn
+
+TOKEN = os.environ.get("WHATSAPP_MCP_TOKEN", "")
+if len(TOKEN) < 32: sys.exit("WHATSAPP_MCP_TOKEN missing/short (run via doppler)")
+SEND = {"send_message", "send_file", "send_audio_message"}
+ALLOW_SEND = os.environ.get("WA_ALLOW_SEND") == "1"
+NEED_APPROVAL = os.environ.get("WA_SEND_APPROVAL", "1") != "0"
+WRITE_EXTRA = {"download_media"}  # writes files locally; off with sends
+tm = main.mcp._tool_manager
+if not ALLOW_SEND:
+    for n in SEND | WRITE_EXTRA: tm._tools.pop(n, None)
+elif NEED_APPROVAL:
+    import asyncio, urllib.request
+    APPR = os.path.expanduser("~/approvals"); os.makedirs(APPR, mode=0o700, exist_ok=True); os.chmod(APPR, 0o700)
+    TIMEOUT = int(os.environ.get("WA_APPROVAL_TIMEOUT", "600"))
+    NOTIFY = os.environ.get("WA_APPROVAL_NOTIFY", "1") != "0"
+    def notify(rid, name, kw):
+        url, key = os.environ.get("GROKBOT_APPROVAL_WEBHOOK_URL"), os.environ.get("GROKBOT_APPROVAL_SENDER_KEY")
+        if not (NOTIFY and url and key): return "skipped"
+        body = json.dumps({"kind": "approval", "request_id": rid, "source": "whatsapp-mcp@pauls-mac-mini",
+            "tool": name, "recipient": kw.get("recipient"), "message": kw.get("message") or kw.get("media_path"),
+            "decision_path": f"pauls-mac-mini:~/approvals/{rid}.decision"}).encode()
+        req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json",
+            "Authorization": "Bearer " + key, "X-Sender-Key": key})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r: return f"http {r.status}"
+        except Exception as e: return f"notify failed: {type(e).__name__}"
+    def gate(name, fn):
+        async def wrapped(**kw):
+            rid = f"wa-{uuid.uuid4().hex[:10]}"
+            fd = os.open(f"{APPR}/{rid}.request", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f: json.dump({"tool": name, "args": kw, "ts": time.time()}, f)
+            n = await asyncio.to_thread(notify, rid, name, kw)
+            dec = f"{APPR}/{rid}.decision"
+            for _ in range(TIMEOUT):
+                if os.path.exists(dec):
+                    if open(dec).read().strip().upper() == "APPROVE":
+                        return await asyncio.to_thread(fn, **kw)
+                    return {"success": False, "message": f"{rid} rejected by Paul"}
+                await asyncio.sleep(1)
+            return {"success": False, "message": f"{rid}: not sent, no approval within {TIMEOUT}s (notify: {n})"}
+        return wrapped
+    for n in SEND:
+        t = tm._tools.get(n)
+        if t: t.fn = gate(n, t.fn); t.is_async = True
+
+# newer mcp validates structured output from type hints; original tools were written for 1.6 (text only)
+for _t in tm._tools.values():
+    try:
+        _t.fn_metadata.output_schema = None; _t.fn_metadata.wrap_output = False
+    except Exception: pass
+
+main.mcp.settings.host = "127.0.0.1"
+main.mcp.settings.port = int(os.environ.get("WA_MCP_PORT", "18765"))
+app = main.mcp.streamable_http_app()
+
+class Auth:
+    def __init__(s, a): s.a = a
+    async def __call__(s, scope, receive, send):
+        if scope["type"] == "http":
+            h = dict(scope.get("headers") or [])
+            got = h.get(b"authorization", b"").decode()
+            if not hmac.compare_digest(got, "Bearer " + TOKEN):
+                await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"unauthorized"}); return
+        await s.a(scope, receive, send)
+
+if __name__ == "__main__":
+    print("tools:", sorted(tm._tools), "send_enabled:", ALLOW_SEND, "approval:", NEED_APPROVAL)
+    uvicorn.run(Auth(app), host="127.0.0.1", port=main.mcp.settings.port, log_level="warning")
